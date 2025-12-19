@@ -1,0 +1,1 @@
+# pic_tag_for_img_text_safe_class
