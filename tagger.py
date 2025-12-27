@@ -6,7 +6,9 @@ from prompt import *
 from get_model_service import MultiModalClient
 from pathlib import Path
 import re
+from multiprocessing import Pool, cpu_count
 import json
+import time
 
 def make_parsed_re(in_text):
     m = re.search(r'(<think>.*?</answer>)', in_text, re.DOTALL)
@@ -14,8 +16,6 @@ def make_parsed_re(in_text):
         content = m.group(1)
         return content
     return None
-
-
 
 class ImageTaggerOuter:
     def __init__(self, in_prompt, api_key, n_num=5):
@@ -56,6 +56,83 @@ class ImageTaggerOuter:
             break
         return outs_parsed
 
+def process_single_image(args):
+    img_path, make_middle_debug = args
+
+    try:
+
+        # ✅【1】先判断是否已经处理过（最重要）
+        pic_head = Path(img_path).stem
+        final_json = f'./middle_data/risk_with_cot_data/{pic_head}_risk_with_cot.json'
+        if os.path.exists(final_json):
+            return (img_path, True, 'skipped')
+
+        # ⚠️ 每个进程内部自己创建 agent
+        api_key = apikey
+
+        risk_gen_agent = ImageTaggerOuter(
+            in_prompt=query_gen_prompt,
+            api_key=api_key,
+            n_num=5
+        )
+        filter_agent = ImageTaggerOuter(
+            in_prompt=risk_filter_prompt,
+            api_key=api_key
+        )
+        cot_gen_agent = ImageTaggerOuter(
+            in_prompt=cot_gen_prompt,
+            api_key=api_key
+        )
+
+        pipline(
+            in_pic_path=img_path,
+            risk_gen_agent=risk_gen_agent,
+            filter_agent=filter_agent,
+            cot_gen_agent=cot_gen_agent,
+            reflection_agent=None,
+            make_middle_debug=make_middle_debug
+        )
+
+        return (img_path, True, None)
+
+    except Exception as e:
+        return (img_path, False, str(e))
+
+def run_on_image_dir_mp(
+    img_dir: str,
+    make_middle_debug=False,
+    num_workers=None,
+    valid_exts=('.jpg', '.jpeg', '.png', '.webp')
+):
+    img_dir = Path(img_dir)
+    img_paths = sorted([
+        str(p) for p in img_dir.iterdir()
+        if p.suffix.lower() in valid_exts
+    ])
+
+    print(f"发现 {len(img_paths)} 张图片")
+
+    if num_workers is None:
+        num_workers = min(4, cpu_count())  # ⚠️ 不要太大
+
+    print(f"使用 {num_workers} 个进程")
+
+    start_time = time.perf_counter()
+
+    with Pool(processes=num_workers) as pool:
+        for img_path, ok, err in pool.imap_unordered(
+            process_single_image,
+            [(p, make_middle_debug) for p in img_paths]
+        ):
+            if ok:
+                print(f"✅ 完成: {Path(img_path).name}")
+            else:
+                print(f"❌ 失败: {Path(img_path).name}")
+                print(err)
+
+    total_time = time.perf_counter() - start_time
+    print(f"\n✅ 全部完成，总耗时: {total_time:.2f} 秒")
+
 
 def pipline(
         in_pic_path, 
@@ -74,7 +151,11 @@ def pipline(
 
     # 1、风险点生成
     if make_middle_debug:
-        risk_content = DataProcessor.read_json('./middle_data/risk_gen_data/cat_risk_gen.json')['risk_content']
+        debug_path = f'./middle_data/risk_gen_data/{pic_head}_risk_gen.json'
+        if not os.path.exists(debug_path):
+            raise FileNotFoundError(debug_path)
+        risk_content = DataProcessor.read_json(debug_path)['risk_content']
+        # risk_content = DataProcessor.read_json('./middle_data/risk_gen_data/cat_risk_gen.json')['risk_content']
     else:
         risk_content = risk_gen_agent.gen_answer(pic_path=in_pic_path, extract_inform='')
         if make_record:
@@ -86,7 +167,10 @@ def pipline(
 
     # 2、无效风险点过滤
     if make_middle_debug:
-        filtered_all_inform = DataProcessor.read_json('./middle_data/risk_filter_data/cat_risk_filter.json')
+        debug_path = f'./middle_data/risk_filter_data/{pic_head}_risk_filter.json'
+        if not os.path.exists(debug_path):
+            raise FileNotFoundError(debug_path)
+        filtered_all_inform = DataProcessor.read_json(debug_path)
         filtered_list = filtered_all_inform['remain_risk_content']
     else:
         filter_result = filter_agent.gen_answer(pic_path=in_pic_path, extract_inform=risk_content_list)
@@ -120,24 +204,42 @@ def pipline(
     print('done')
 
 
-
 if __name__ == '__main__':
-    
-    import time
-    pic_path = './safe_pic/cat.jpg'
-    api_key = apikey
-    
-    risk_gen_agent = ImageTaggerOuter(in_prompt=query_gen_prompt, api_key=api_key, n_num=5)
-    filter_agent = ImageTaggerOuter(in_prompt=risk_filter_prompt, api_key=api_key)
-    cot_gen_agent = ImageTaggerOuter(in_prompt=cot_gen_prompt, api_key=api_key)
-
-    pipline(
-        in_pic_path=pic_path,
-        risk_gen_agent=risk_gen_agent,
-        filter_agent=filter_agent,
-        cot_gen_agent=cot_gen_agent,
-        reflection_agent=None
+    run_on_image_dir_mp(
+        img_dir='./safe_pic/coco_safe_test_10',
+        make_middle_debug=False,
+        num_workers=6   # 👈 建议 2~6 之间
     )
+
+# if __name__ == '__main__':
+#
+#     import time
+#     # pic_path = './safe_pic/coco_safe_test_80/000000000073.jpg'
+#     # pic_path = './safe_pic/cat2.jpg'
+#
+#     start_time = time.perf_counter()
+#
+#     api_key = apikey
+#
+#     risk_gen_agent = ImageTaggerOuter(in_prompt=query_gen_prompt, api_key=api_key, n_num=5)
+#     filter_agent = ImageTaggerOuter(in_prompt=risk_filter_prompt, api_key=api_key)
+#     cot_gen_agent = ImageTaggerOuter(in_prompt=cot_gen_prompt, api_key=api_key)
+#
+#     img_dir = './safe_pic/coco_safe_test_10'  # 👈 放图片的文件夹
+#
+#     run_on_image_dir(
+#         img_dir=img_dir,
+#         risk_gen_agent=risk_gen_agent,
+#         filter_agent=filter_agent,
+#         cot_gen_agent=cot_gen_agent,
+#         reflection_agent=None,
+#         make_middle_debug=False
+#     )
+#
+#     total_time = time.perf_counter() - start_time
+#
+#     print(f"\n✅ 文件夹处理完成，总耗时: {total_time:.2f} 秒")
+
     # filter_agent = ImageTagger(in_prompt=, vlm_port=, llm_port=)
     # cot_gen_agent = ImageTagger(in_prompt=, vlm_port=, llm_port=)
     # reflection_agent = ImageTagger(in_prompt=, vlm_port=, llm_port=)
